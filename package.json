@@ -1,0 +1,44 @@
+{
+  "name": "dsh-no-loop-plugin",
+  "version": "0.1.0",
+  "description": "在流式推理里检测复读与自指打转，命中即截断该块，避免退化思考被回灌进上下文。",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./detector": "./detector.mjs"
+  },
+  "files": [
+    "index.js",
+    "detector.mjs",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "loop",
+    "reasoning",
+    "guard",
+    "deepseek-harness"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/54nanmiao/dsh-no-loop-plugin.git"
+  },
+  "homepage": "https://github.com/54nanmiao/dsh-no-loop-plugin",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node test-detector.mjs && node test-fp.mjs && node test-review.mjs && node test-stream.mjs && node test-tier.mjs",
+    "eval": "node eval-guard.mjs"
+  }
+}

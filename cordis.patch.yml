@@ -1,0 +1,11 @@
+# dsh-no-loop-plugin 的 bundle 层
+#
+# 约定：profile 的 package.json 在 dsh.profile.bundles 里列出本包名后，
+# 加载器按 dsh.bundle.patch 指向的文件，把这里的 insert 行并进配置树。
+# 只做新增行，不覆盖任何随 DSH 发布的既有行。
+#
+# 阈值都在 detector.mjs 的 CONFIG 里，这里不配 config（用默认值）。
+
+- insert:
+    - id: no-loop
+      name: dsh-no-loop-plugin
