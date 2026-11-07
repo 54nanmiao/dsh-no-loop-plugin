@@ -1,15 +1,17 @@
 {
   "name": "dsh-no-loop-plugin",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "在流式推理里检测复读与自指打转，命中即截断该块，避免退化思考被回灌进上下文。",
   "type": "module",
   "main": "index.js",
   "exports": {
     ".": "./index.js",
-    "./detector": "./detector.mjs"
+    "./detector": "./detector.mjs",
+    "./client": "./client.js"
   },
   "files": [
     "index.js",
+    "client.js",
     "detector.mjs",
     "cordis.patch.yml",
     "README.md",
@@ -35,10 +37,14 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [],
+      "platform": "web"
     }
   },
   "scripts": {
-    "test": "node test-detector.mjs && node test-fp.mjs && node test-review.mjs && node test-stream.mjs && node test-tier.mjs",
+    "test": "node test-detector.mjs && node test-fp.mjs && node test-review.mjs && node test-stream.mjs && node test-tier.mjs && node test-ui.mjs && node test-client.mjs",
     "eval": "node eval-guard.mjs"
   }
 }

@@ -14,6 +14,7 @@
 //   3. 保留 loop__check / loop__reset 工具与提示词纪律
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { detect, truncate, CONFIG, isStepLoop, recycleStats, ritualStats, strongLoop, ruleScores, YIELD } from './detector.mjs';
@@ -22,6 +23,103 @@ import { detect, truncate, CONFIG, isStepLoop, recycleStats, ritualStats, strong
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 // 数据目录在调用时解析：测试可用 NO_LOOP_DATA_DIR 指到临时目录，避免污染真实 halt.log
 const dataDir = () => (process.env.NO_LOOP_DATA_DIR ? path.resolve(process.env.NO_LOOP_DATA_DIR) : path.join(HERE, 'data'));
+const ROUTE = '/plugins/dsh-no-loop-plugin';
+
+// ---------- 可调配置（0.2.0）----------
+// 落盘在 ~/.dsh/no-loop.json；界面上「设置 → 防循环」改的就是这份。
+const CONFIG_FILE = path.join(os.homedir(), '.dsh', 'no-loop.json');
+export const DEFAULTS = Object.freeze({
+  streamGuard: true,   // 流中熔断：命中就截断这段 reasoning
+  rule: true,          // 往系统提示词里注入那段「防循环纪律」
+  sensitivity: 'normal', // loose | normal | strict
+  minProbe: 80,        // 攒够这么多字才开始判
+  probeStep: 40,       // 每多攒这么多字判一次
+  probeTail: 4000,     // 判定只看尾部这么多字
+  chatMax: 1200,       // 整块不足这么多字 = 聊天档（放宽）
+});
+
+// 三档灵敏度只动「多容易算是打转」的那几个阈值，其余结构性参数不动。
+const PRESETS = {
+  loose: { recycleStrong: 0.90, uniqueStrong: 0.30, ritualCount: 16, chatRecycle: 0.95, chatRitualCount: 18, chatFragMin: 8, chatMax: 1500 },
+  normal: { recycleStrong: 0.85, uniqueStrong: 0.30, ritualCount: 12, chatRecycle: 0.92, chatRitualCount: 14, chatFragMin: 6, chatMax: 1200 },
+  strict: { recycleStrong: 0.78, uniqueStrong: 0.34, ritualCount: 8, chatRecycle: 0.88, chatRitualCount: 10, chatFragMin: 5, chatMax: 900 },
+};
+
+const num = (v, lo, hi, dflt) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.min(hi, Math.max(lo, Math.round(n))) : dflt;
+};
+
+export function normalizeConfig(j = {}) {
+  const src = j && typeof j === 'object' ? j : {};
+  const sensitivity = ['loose', 'normal', 'strict'].includes(src.sensitivity) ? src.sensitivity : DEFAULTS.sensitivity;
+  return {
+    streamGuard: src.streamGuard !== false,
+    rule: src.rule !== false,
+    sensitivity,
+    minProbe: num(src.minProbe, 20, 2000, DEFAULTS.minProbe),
+    probeStep: num(src.probeStep, 10, 2000, DEFAULTS.probeStep),
+    probeTail: num(src.probeTail, 400, 20000, DEFAULTS.probeTail),
+    chatMax: num(src.chatMax, 200, 20000, PRESETS[sensitivity].chatMax),
+  };
+}
+
+/** 运行中的生效配置：guardStream 每次调用都读它，所以界面上改完不用重启就能生效 */
+export const RUNTIME = { ...DEFAULTS };
+
+export function loadConfig() {
+  try {
+    return normalizeConfig(JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')));
+  } catch {
+    return { ...DEFAULTS };
+  }
+}
+
+/** 把配置灌进 RUNTIME，并把灵敏度写进 detector 的 CONFIG（CONFIG 是可变对象，detect 每次现读） */
+export function applyRuntime(cfg) {
+  Object.assign(RUNTIME, normalizeConfig(cfg));
+  const preset = PRESETS[RUNTIME.sensitivity] || PRESETS.normal;
+  for (const [k, v] of Object.entries(preset)) CONFIG[k] = v;
+  if (RUNTIME.chatMax) CONFIG.chatMax = RUNTIME.chatMax;
+  return { ...RUNTIME };
+}
+
+export function saveConfig(patch = {}) {
+  const next = normalizeConfig({ ...loadConfig(), ...patch });
+  fs.mkdirSync(path.dirname(CONFIG_FILE), { recursive: true });
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(next, null, 2) + '\n', 'utf8');
+  applyRuntime(next);
+  return next;
+}
+
+applyRuntime(loadConfig());
+
+/** 命中统计：读 halt.log（最多 5MB，一天几行，够快） */
+export function haltStats() {
+  const file = path.join(dataDir(), 'halt.log');
+  const out = { ok: false, file, today: 0, total: 0, lastAt: null, lastReasons: null, lastChars: null };
+  let raw = '';
+  try {
+    raw = fs.readFileSync(file, 'utf8');
+  } catch {
+    return out;
+  }
+  out.ok = true;
+  const todayKey = new Date().toLocaleDateString('sv-SE'); // YYYY-MM-DD 本地时区
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    out.total += 1;
+    try {
+      const j = JSON.parse(line);
+      if (String(j.ts || '').slice(0, 10) === todayKey) out.today += 1;
+      out.lastAt = j.ts || out.lastAt;
+      out.lastReasons = j.reasons || out.lastReasons;
+      out.lastChars = j.chars ?? out.lastChars;
+    } catch { /* 半行/坏行忽略 */ }
+  }
+  return out;
+}
+
 
 /** 内容类型指纹：一眼分清「真复读」和「代码/表格/日志/正常长文」 */
 export function contentStats(t) {
@@ -250,13 +348,15 @@ async function* guardStream(upstream, opts = {}) {
 export function apply(ctx, config = {}) {
   const disposers = [];
   const tools = ctx.get?.('tools');
-  // 配置真正往下传（旧版 apply(ctx, config) 收了 config 却没人用）
-  const STREAM_OPTS = {
-    minProbe: Number(config.minProbe ?? MIN_PROBE),
-    probeStep: Number(config.probeStep ?? PROBE_STEP),
-    probeTail: Number(config.probeTail ?? PROBE_TAIL),
-    ritualMinChars: Number(config.ritualMinChars ?? RITUAL_MIN_CHARS),
-  };
+  // profile 里写的 config 并进运行配置（界面改的落盘文件优先，这里只做启动补齐）
+  if (config && Object.keys(config).length) applyRuntime({ ...loadConfig(), ...config });
+  // 每次开流现读，界面上改完下一个回合就生效
+  const streamOpts = () => ({
+    ritualMinChars: RITUAL_MIN_CHARS,
+    minProbe: RUNTIME.minProbe,
+    probeStep: RUNTIME.probeStep,
+    probeTail: RUNTIME.probeTail,
+  });
 
   // ---- 工具：手动检测（保留，给"输出前自查"用） ----
   if (tools?.register) {
@@ -355,8 +455,8 @@ export function apply(ctx, config = {}) {
   // 但包 stream 这件事本身仍有风险面（上游迭代中途抛错无法回放）。
   // 所以默认关掉，只保留 loop__check 工具 + 提示词纪律这两样零风险的。
   // 想重新启用：把下面这行改成 true，重启 DSH，然后开一个新会话观察一两轮。
-  const ENABLE_STREAM_GUARD = config.streamGuard !== false;
-  if (ENABLE_STREAM_GUARD && typeof ctx.on === 'function') {
+  // 监听器常挂，开关在回调里读 RUNTIME —— 这样界面关掉再打开不用重启
+  if (typeof ctx.on === 'function') {
     try {
       // 必须同步返回：cordis 的 waterfall 是纯同步的（cordis/lib/index.js:317-325，
       // next() 直接 return 最外层监听器的返回值，任何 await 都不会被等），
@@ -367,10 +467,11 @@ export function apply(ctx, config = {}) {
         if (!upstream || typeof upstream[Symbol.asyncIterator] !== 'function') {
           return upstream; // 上游不是流（或本身就是 Promise），原样放行
         }
+        if (RUNTIME.streamGuard === false) return upstream; // 界面上关了
         const o = options && typeof options === 'object' ? options : {};
         const sid = String(o.sessionId ?? o.session?.id ?? o.context?.sessionId ?? '') || '';
         try {
-          return guardStream(upstream, { ...STREAM_OPTS, sid });
+          return guardStream(upstream, { ...streamOpts(), sid });
         } catch {
           return upstream; // 包不起来就原样放行
         }
@@ -382,7 +483,7 @@ export function apply(ctx, config = {}) {
   }
 
   // ---- 系统提示词：常驻纪律 ----
-  if (config.rule !== false) {
+  if (RUNTIME.rule !== false) {
   try {
     const registerSection = (sp) => {
       if (!sp?.section) return;
@@ -400,6 +501,76 @@ export function apply(ctx, config = {}) {
   } catch {
     /* 没有 systemPrompt 服务就只保留工具与拦截 */
   }
+  }
+
+  // ---- 设置面板：读状态 / 写配置（0.2.0）----
+  if (typeof ctx.inject === 'function') {
+    try {
+      ctx.inject(['webServer'], (hostCtx) => {
+        const host = hostCtx;
+        if (!host?.webServer?.register || typeof host.effect !== 'function') return;
+
+        const sendJson = (res, status, payload) => {
+          res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+          res.end(JSON.stringify(payload));
+        };
+        const readBody = (req, cap = 8192) => new Promise((resolve, reject) => {
+          let size = 0;
+          const chunks = [];
+          req.on('data', (c) => {
+            size += c.length;
+            if (size > cap) { reject(new Error('body too large')); req.destroy(); return; }
+            chunks.push(c);
+          });
+          req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+          req.on('error', reject);
+        });
+
+        host.effect(() => [
+          host.webServer.register({
+            kind: 'exact',
+            path: ROUTE + '/state',
+            handler: (req, res) => {
+              if (req.method !== 'GET') { res.writeHead(405, { allow: 'GET' }); return res.end(); }
+              return sendJson(res, 200, {
+                ok: true,
+                config: loadConfig(),
+                runtime: { ...RUNTIME },
+                stats: haltStats(),
+                file: CONFIG_FILE,
+              });
+            },
+          }),
+          host.webServer.register({
+            kind: 'exact',
+            path: ROUTE + '/config',
+            handler: async (req, res) => {
+              if (req.method === 'GET') {
+                return sendJson(res, 200, { ok: true, config: loadConfig(), file: CONFIG_FILE });
+              }
+              if (req.method !== 'POST') {
+                res.writeHead(405, { allow: 'GET, POST' });
+                return res.end();
+              }
+              let raw;
+              try {
+                raw = JSON.parse((await readBody(req)) || '{}');
+              } catch (e) {
+                return sendJson(res, 400, { ok: false, reason: 'bad-json', detail: String(e?.message ?? e) });
+              }
+              try {
+                const config = saveConfig(raw);
+                return sendJson(res, 200, { ok: true, config, file: CONFIG_FILE });
+              } catch (e) {
+                return sendJson(res, 500, { ok: false, reason: 'config-write-failed', detail: String(e?.message ?? e) });
+              }
+            },
+          }),
+        ]);
+      });
+    } catch (e) {
+      console.error('[no-loop] 注册设置路由失败：', e?.message ?? e);
+    }
   }
 
   return () => disposers.forEach((d) => d?.());

@@ -4,8 +4,10 @@
 # 加载器按 dsh.bundle.patch 指向的文件，把这里的 insert 行并进配置树。
 # 只做新增行，不覆盖任何随 DSH 发布的既有行。
 #
-# 阈值都在 detector.mjs 的 CONFIG 里，这里不配 config（用默认值）。
+# id 用包名：客户端半边（package.json 的 dsh.client + exports["./client"]）
+# 按包名解析，id 与 name 一致最不容易出错。
+# 检测阈值在 detector.mjs 的 CONFIG，用户可调项在 ~/.dsh/no-loop.json（设置面板写它）。
 
 - insert:
-    - id: no-loop
+    - id: dsh-no-loop-plugin
       name: dsh-no-loop-plugin
